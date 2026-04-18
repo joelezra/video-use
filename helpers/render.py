@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -37,15 +38,46 @@ except Exception:
     def auto_grade_for_clip(video, start=0.0, duration=None, verbose=False):  # type: ignore
         return "eq=contrast=1.03:saturation=0.98", {}
 
+# Face-aware vertical crop. Import from content-engine helpers at runtime so
+# the fallback still works if the module is missing (e.g. minimal installs).
+try:
+    _CE_HELPERS = Path(__file__).resolve().parents[2] / "content-engine" / "helpers"
+    if str(_CE_HELPERS) not in sys.path:
+        sys.path.insert(0, str(_CE_HELPERS))
+    from face_crop import (  # type: ignore
+        crop_x_frac_for_segment,
+        detect_face_track,
+        build_crop_x_expr,
+    )
+    _HAS_FACE_CROP = True
+except Exception:
+    _HAS_FACE_CROP = False
 
-# -------- Subtitle style (proven at 1920×1080, from HEURISTICS §5) -----------
+    def crop_x_frac_for_segment(source, start_s, end_s, samples=3, fallback=0.5):  # type: ignore
+        return fallback
 
-SUB_FORCE_STYLE = (
-    "FontName=Helvetica,FontSize=18,Bold=1,"
+    def detect_face_track(source, start_s, end_s, **kwargs):  # type: ignore
+        return [(0.0, 0.5)]
+
+    def build_crop_x_expr(track, cw):  # type: ignore
+        return f"(iw-{cw})/2"
+
+
+# -------- Subtitle style (tuned for 1080×1920 vertical Shorts) ---------------
+# libass auto-scales from its default PlayResY=288 to the video height.
+# Alignment=5 = middle-center. Positions captions at the "hook zone" (upper
+# third of frame) — avoids conflict with burned-in source captions that
+# commonly live in the bottom 15-20% of livestream content (church services,
+# some podcast overlays). Overridable via SUB_FORCE_STYLE env var.
+
+_DEFAULT_SUB_FORCE_STYLE = (
+    "FontName=Helvetica,FontSize=24,Bold=1,"
     "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BackColour=&H00000000,"
     "BorderStyle=1,Outline=2,Shadow=0,"
-    "Alignment=2,MarginV=35"
+    "Alignment=7,MarginL=30,MarginV=30"
 )
+
+SUB_FORCE_STYLE = os.environ.get("SUB_FORCE_STYLE", _DEFAULT_SUB_FORCE_STYLE)
 
 # -------- Helpers ------------------------------------------------------------
 
@@ -95,22 +127,35 @@ def extract_segment(
     out_path: Path,
     preview: bool = False,
     draft: bool = False,
+    crop_x_frac: float = 0.5,
+    crop_x_track: list[tuple[float, float]] | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
-    `-ss` before `-i` for fast accurate seeking. Scale to 1080p from 4K.
+    `-ss` before `-i` for fast accurate seeking. Scale to target height, then
+    crop a 9:16 vertical window whose horizontal center follows either a
+    static `crop_x_frac` (default) or a time-varying `crop_x_track` — a list
+    of (t_rel_s, x_frac) tuples, piecewise-linearly interpolated so the crop
+    follows the speaker if they move. The crop window is clamped so it never
+    exceeds the scaled frame's bounds.
 
     Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
-      - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
-      - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+      - final (default): 1080×1920 libx264 fast CRF 20
+      - preview:         1080×1920 libx264 medium CRF 22
+      - draft:           720×1280 libx264 ultrafast CRF 28
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     if draft:
-        scale = "scale=1280:-2"
+        cw, ch = 720, 1280
     else:
-        scale = "scale=1920:-2"
+        cw, ch = 1080, 1920
+    if crop_x_track and len(crop_x_track) > 0:
+        x_expr = build_crop_x_expr(crop_x_track, cw)
+    else:
+        # Static crop: single-point "track" simplifies to the same clamp form.
+        x_expr = f"max(0\\,min(iw-{cw}\\,iw*{crop_x_frac:.4f}-{cw // 2}))"
+    scale = f"scale=-2:{ch},crop={cw}:{ch}:'{x_expr}':0"
 
     vf_parts = [scale]
     if grade_filter:
@@ -167,6 +212,49 @@ def extract_all_segments(
     ranges = edl["ranges"]
     sources = edl["sources"]
 
+    # Group ranges into "continuous blocks" — same source, adjacent in source
+    # time (end of prev ≈ start of next). Within a block we compute one
+    # shared face-crop decision so consecutive ranges don't jump sideways at
+    # the concat point.
+    blocks: list[list[int]] = []
+    for i, r in enumerate(ranges):
+        if blocks:
+            prev_i = blocks[-1][-1]
+            prev = ranges[prev_i]
+            if (
+                prev["source"] == r["source"]
+                and abs(float(prev["end"]) - float(r["start"])) < 0.05
+            ):
+                blocks[-1].append(i)
+                continue
+        blocks.append([i])
+
+    # Pre-compute one crop decision per block.
+    block_crop: dict[int, dict] = {}  # range index → {mode, x_frac|track}
+    for block in blocks:
+        first_i, last_i = block[0], block[-1]
+        r0, rn = ranges[first_i], ranges[last_i]
+        src_path = resolve_path(sources[r0["source"]], edit_dir)
+        block_start = float(r0["start"])
+        block_end = float(rn["end"])
+        track = detect_face_track(src_path, block_start, block_end, emit_interval_s=1.0)
+        xs = [x for _, x in track]
+        x_min, x_max, x_range = min(xs), max(xs), max(xs) - min(xs)
+        MOTION_GATE = 0.08
+        if x_range >= MOTION_GATE:
+            decision = {"mode": "track", "track": track, "dbg": f"{len(track)} pts Δ={x_range:.3f}"}
+        else:
+            sorted_xs = sorted(xs)
+            xf = sorted_xs[len(sorted_xs) // 2]
+            decision = {"mode": "static", "x_frac": xf, "dbg": f"x={xf:.3f} Δ={x_range:.3f}"}
+        if len(block) > 1:
+            print(
+                f"  block {first_i}-{last_i} ({r0['source']}, "
+                f"{block_start:.2f}-{block_end:.2f}): shared {decision['mode']} {decision['dbg']}"
+            )
+        for idx in block:
+            block_crop[idx] = decision
+
     seg_paths: list[Path] = []
     print(f"extracting {len(ranges)} segment(s) → {clips_dir.name}/")
     if is_auto:
@@ -188,7 +276,30 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft)
+        decision = block_crop[i]
+        if decision["mode"] == "track":
+            # Offset the shared track into this range's local time.
+            block_start = float(ranges[next(idx for idx, d in block_crop.items() if d is decision)]["start"])  # first range's start
+            # Simpler: locate first range in this block — it's whichever shares this decision dict first.
+            first_in_block = next(idx for idx in sorted(block_crop.keys()) if block_crop[idx] is decision)
+            block_start = float(ranges[first_in_block]["start"])
+            offset = start - block_start
+            local_track = [(max(0.0, t - offset), x) for t, x in decision["track"] if offset - 0.5 <= t <= offset + duration + 0.5]
+            if not local_track:
+                local_track = [(0.0, decision["track"][0][1])]
+            print(f"        tracking (shared): {len(local_track)} pts")
+            extract_segment(
+                src_path, start, duration, seg_filter, out_path,
+                preview=preview, draft=draft, crop_x_track=local_track,
+            )
+        else:
+            crop_x_frac = decision["x_frac"]
+            if abs(crop_x_frac - 0.5) > 0.02:
+                print(f"        static crop_x_frac: {crop_x_frac:.3f}")
+            extract_segment(
+                src_path, start, duration, seg_filter, out_path,
+                preview=preview, draft=draft, crop_x_frac=crop_x_frac,
+            )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -471,9 +582,22 @@ def build_final_composite(
     # Subtitles LAST — Rule 1
     if has_subs:
         subs_abs = str(subtitles_path.resolve()).replace(":", r"\:").replace("'", r"\'")
-        filter_parts.append(
-            f"{current}subtitles='{subs_abs}':force_style='{SUB_FORCE_STYLE}'[outv]"
-        )
+        # ASS files carry their own Style definitions (karaoke / per-word
+        # highlighting) — do NOT force_style over them or we lose the
+        # color / scale overrides. For SRT we apply SUB_FORCE_STYLE.
+        if subtitles_path.suffix.lower() == ".ass":
+            filter_parts.append(
+                f"{current}subtitles='{subs_abs}'[outv]"
+            )
+        else:
+            # Commas in force_style must be backslash-escaped — ffmpeg filter
+            # parser treats unescaped commas as filter separators and silently
+            # drops the remainder of the style string (so Alignment/MarginV/etc
+            # are lost).
+            style_escaped = SUB_FORCE_STYLE.replace(",", r"\,")
+            filter_parts.append(
+                f"{current}subtitles='{subs_abs}':force_style='{style_escaped}'[outv]"
+            )
         out_label = "[outv]"
     else:
         # Rename the last overlay output to [outv] for consistency
@@ -530,6 +654,11 @@ def main() -> None:
         help="Skip subtitles even if the EDL references one",
     )
     ap.add_argument(
+        "--no-karaoke",
+        action="store_true",
+        help="Use plain SRT instead of word-level karaoke ASS (when --build-subtitles)",
+    )
+    ap.add_argument(
         "--no-loudnorm",
         action="store_true",
         help="Skip audio loudness normalization. Default is on (-14 LUFS, -1 dBTP, LRA 11).",
@@ -563,8 +692,22 @@ def main() -> None:
     subs_path: Path | None = None
     if not args.no_subtitles:
         if args.build_subtitles:
-            subs_path = edit_dir / "master.srt"
-            build_master_srt(edl, edit_dir, subs_path)
+            # Build both SRT (fallback / text search) and karaoke ASS.
+            # ASS is preferred when present — word-level highlight beats
+            # static 2-word chunks for retention.
+            srt_path = edit_dir / "master.srt"
+            build_master_srt(edl, edit_dir, srt_path)
+            if not args.no_karaoke:
+                try:
+                    from karaoke_ass import build_master_ass  # type: ignore
+                    ass_path = edit_dir / "master.ass"
+                    build_master_ass(edl, edit_dir, ass_path)
+                    subs_path = ass_path
+                except Exception as e:
+                    print(f"  karaoke ASS build failed ({e}), falling back to SRT")
+                    subs_path = srt_path
+            else:
+                subs_path = srt_path
         elif edl.get("subtitles"):
             subs_path = resolve_path(edl["subtitles"], edit_dir)
             if not subs_path.exists():
